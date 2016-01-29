@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"camlistore.org/pkg/throttle"
+	"github.com/chentmin/go-zookeeper/throttle"
 )
 
 func TestCreate(t *testing.T) {

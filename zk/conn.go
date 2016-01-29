@@ -35,16 +35,16 @@ var ErrInvalidPath = errors.New("zk: invalid path")
 var DefaultLogger Logger = defaultLogger{}
 
 const (
-	bufferSize      = 1536 * 1024
-	eventChanSize   = 6
-	sendChanSize    = 16
+	bufferSize = 1536 * 1024
+	eventChanSize = 6
+	sendChanSize = 16
 	protectedPrefix = "_c_"
 )
 
 type watchType int
 
 const (
-	watchTypeData  = iota
+	watchTypeData = iota
 	watchTypeExist = iota
 	watchTypeChild = iota
 )
@@ -62,34 +62,35 @@ type Logger interface {
 }
 
 type Conn struct {
-	lastZxid         int64
-	sessionID        int64
-	state            State // must be 32-bit aligned
-	xid              uint32
-	sessionTimeoutMs int32 // session timeout in milliseconds
-	passwd           []byte
+	lastZxid                 int64
+	sessionID                int64
+	state                    State              // must be 32-bit aligned
+	xid                      uint32
+	sessionTimeoutMs         int32              // session timeout in milliseconds
+	passwd                   []byte
 
-	dialer         Dialer
-	hostProvider   HostProvider
-	serverMu       sync.Mutex // protects server
-	server         string     // remember the address/port of the current server
-	conn           net.Conn
-	eventChan      chan Event
-	shouldQuit     chan struct{}
-	pingInterval   time.Duration
-	recvTimeout    time.Duration
-	connectTimeout time.Duration
+	dialer                   Dialer
+	hostProvider             HostProvider
+	serverMu                 sync.Mutex         // protects server
+	server                   string             // remember the address/port of the current server
+	conn                     net.Conn
+	eventChan                chan Event
+	shouldQuit               chan struct{}
+	pingInterval             time.Duration
+	recvTimeout              time.Duration
+	connectTimeout           time.Duration
+	reconnectAfterDisconnect bool
 
-	sendChan     chan *request
-	requests     map[int32]*request // Xid -> pending request
-	requestsLock sync.Mutex
-	watchers     map[watchPathType][]chan Event
-	watchersLock sync.Mutex
+	sendChan                 chan *request
+	requests                 map[int32]*request // Xid -> pending request
+	requestsLock             sync.Mutex
+	watchers                 map[watchPathType][]chan Event
+	watchersLock             sync.Mutex
 
-	// Debug (used by unit tests)
-	reconnectDelay time.Duration
+												// Debug (used by unit tests)
+	reconnectDelay           time.Duration
 
-	logger Logger
+	logger                   Logger
 }
 
 // connOption represents a connection option.
@@ -109,7 +110,7 @@ type request struct {
 	// In order to not hard code the watch logic for each opcode in the recv
 	// loop the caller can use recvFunc to insert some synchronously code
 	// after a response.
-	recvFunc func(*request, *responseHeader, error)
+	recvFunc   func(*request, *responseHeader, error)
 }
 
 type response struct {
@@ -185,7 +186,7 @@ func Connect(servers []string, sessionTimeout time.Duration, options ...connOpti
 		watchers:       make(map[watchPathType][]chan Event),
 		passwd:         emptyPassword,
 		logger:         DefaultLogger,
-
+		reconnectAfterDisconnect: true,
 		// Debug
 		reconnectDelay: 0,
 	}
@@ -208,6 +209,12 @@ func Connect(servers []string, sessionTimeout time.Duration, options ...connOpti
 		close(conn.eventChan)
 	}()
 	return conn, ec, nil
+}
+
+func WithReconnectAfterDisconnect(autoreconnect bool) connOption {
+	return func(c *Conn) {
+		c.reconnectAfterDisconnect = autoreconnect
+	}
 }
 
 // WithDialer returns a connection option specifying a non-default Dialer.
@@ -256,7 +263,7 @@ func (c *Conn) setState(state State) {
 	select {
 	case c.eventChan <- Event{Type: EventSession, State: state, Server: c.Server()}:
 	default:
-		// panic("zk: event channel full - it must be monitored and never allowed to be full")
+	// panic("zk: event channel full - it must be monitored and never allowed to be full")
 	}
 }
 
@@ -271,7 +278,7 @@ func (c *Conn) connect() error {
 			c.flushUnsentRequests(ErrNoServer)
 			select {
 			case <-time.After(time.Second):
-				// pass
+			// pass
 			case <-c.shouldQuit:
 				c.setState(StateDisconnected)
 				c.flushUnsentRequests(ErrClosing)
@@ -348,6 +355,11 @@ func (c *Conn) loop() {
 			err = ErrConnectionClosed
 		}
 		c.flushRequests(err)
+
+		if !c.reconnectAfterDisconnect{
+			c.logger.Printf("Disconnected and not reconnecting")
+			return
+		}
 
 		if c.reconnectDelay > 0 {
 			select {
@@ -457,7 +469,7 @@ func (c *Conn) authenticate() error {
 	binary.BigEndian.PutUint32(buf[:4], uint32(n))
 
 	c.conn.SetWriteDeadline(time.Now().Add(c.recvTimeout * 10))
-	_, err = c.conn.Write(buf[:n+4])
+	_, err = c.conn.Write(buf[:n + 4])
 	c.conn.SetWriteDeadline(time.Time{})
 	if err != nil {
 		return err
@@ -517,7 +529,7 @@ func (c *Conn) sendLoop(conn net.Conn, closeChan <-chan struct{}) error {
 				continue
 			}
 
-			n2, err := encodePacket(buf[4+n:], req.pkt)
+			n2, err := encodePacket(buf[4 + n:], req.pkt)
 			if err != nil {
 				req.recvChan <- response{-1, err}
 				continue
@@ -528,18 +540,18 @@ func (c *Conn) sendLoop(conn net.Conn, closeChan <-chan struct{}) error {
 			binary.BigEndian.PutUint32(buf[:4], uint32(n))
 
 			c.requestsLock.Lock()
-			select {
-			case <-closeChan:
-				req.recvChan <- response{-1, ErrConnectionClosed}
-				c.requestsLock.Unlock()
-				return ErrConnectionClosed
-			default:
-			}
+				select {
+				case <-closeChan:
+					req.recvChan <- response{-1, ErrConnectionClosed}
+					c.requestsLock.Unlock()
+					return ErrConnectionClosed
+				default:
+				}
 			c.requests[req.xid] = req
 			c.requestsLock.Unlock()
 
 			conn.SetWriteDeadline(time.Now().Add(c.recvTimeout))
-			_, err = conn.Write(buf[:n+4])
+			_, err = conn.Write(buf[:n + 4])
 			conn.SetWriteDeadline(time.Time{})
 			if err != nil {
 				req.recvChan <- response{-1, err}
@@ -555,7 +567,7 @@ func (c *Conn) sendLoop(conn net.Conn, closeChan <-chan struct{}) error {
 			binary.BigEndian.PutUint32(buf[:4], uint32(n))
 
 			conn.SetWriteDeadline(time.Now().Add(c.recvTimeout))
-			_, err = conn.Write(buf[:n+4])
+			_, err = conn.Write(buf[:n + 4])
 			conn.SetWriteDeadline(time.Time{})
 			if err != nil {
 				conn.Close()
@@ -596,7 +608,7 @@ func (c *Conn) recvLoop(conn net.Conn) error {
 
 		if res.Xid == -1 {
 			res := &watcherEvent{}
-			_, err := decodePacket(buf[16:16+blen], res)
+			_, err := decodePacket(buf[16:16 + blen], res)
 			if err != nil {
 				return err
 			}
@@ -653,7 +665,7 @@ func (c *Conn) recvLoop(conn net.Conn) error {
 				if res.Err != 0 {
 					err = res.Err.toError()
 				} else {
-					_, err = decodePacket(buf[16:16+blen], req.recvStruct)
+					_, err = decodePacket(buf[16:16 + blen], req.recvStruct)
 				}
 				if req.recvFunc != nil {
 					req.recvFunc(req, &res, err)
@@ -773,16 +785,16 @@ func (c *Conn) CreateProtectedEphemeralSequential(path string, data []byte, acl 
 	guidStr := fmt.Sprintf("%x", guid)
 
 	parts := strings.Split(path, "/")
-	parts[len(parts)-1] = fmt.Sprintf("%s%s-%s", protectedPrefix, guidStr, parts[len(parts)-1])
-	rootPath := strings.Join(parts[:len(parts)-1], "/")
+	parts[len(parts) - 1] = fmt.Sprintf("%s%s-%s", protectedPrefix, guidStr, parts[len(parts) - 1])
+	rootPath := strings.Join(parts[:len(parts) - 1], "/")
 	protectedPath := strings.Join(parts, "/")
 
 	var newPath string
 	for i := 0; i < 3; i++ {
-		newPath, err = c.Create(protectedPath, data, FlagEphemeral|FlagSequence, acl)
+		newPath, err = c.Create(protectedPath, data, FlagEphemeral | FlagSequence, acl)
 		switch err {
 		case ErrSessionExpired:
-			// No need to search for the node since it can't exist. Just try again.
+		// No need to search for the node since it can't exist. Just try again.
 		case ErrConnectionClosed:
 			children, _, err := c.Children(rootPath)
 			if err != nil {
@@ -790,8 +802,8 @@ func (c *Conn) CreateProtectedEphemeralSequential(path string, data []byte, acl 
 			}
 			for _, p := range children {
 				parts := strings.Split(p, "/")
-				if pth := parts[len(parts)-1]; strings.HasPrefix(pth, protectedPrefix) {
-					if g := pth[len(protectedPrefix) : len(protectedPrefix)+32]; g == guidStr {
+				if pth := parts[len(parts) - 1]; strings.HasPrefix(pth, protectedPrefix) {
+					if g := pth[len(protectedPrefix) : len(protectedPrefix) + 32]; g == guidStr {
 						return rootPath + "/" + p, nil
 					}
 				}
